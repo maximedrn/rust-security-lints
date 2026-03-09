@@ -768,14 +768,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "panic_usage"
-version = "1.0.0"
-dependencies = [
- "dylint_linting",
- "dylint_testing",
-]
-
-[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
