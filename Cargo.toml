@@ -1,10 +1,5 @@
 [workspace]
-members = [
-    "rules/missing_type",
-    "rules/unsafe_usage",
-    "rules/panic_usage",
-    "rules/indexing_usage",
-]
+members = ["rules/missing_type", "rules/unsafe_usage", "rules/indexing_usage"]
 resolver = "2"
 
 [workspace.metadata.dylint]

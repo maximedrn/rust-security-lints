@@ -7,7 +7,13 @@ extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 
-use rustc_errors::Diag;
+use rustc_errors::{
+    Diag,
+    DiagCtxtHandle,
+    Diagnostic,
+    EmissionGuarantee,
+    Level,
+};
 use rustc_hir::{Expr, ExprKind, Item, ItemKind};
 use rustc_lint::{LateContext, LateLintPass, LintContext, LintStore};
 use rustc_middle::ty::TyCtxt;
@@ -20,71 +26,82 @@ declare_lint! {
 }
 declare_lint_pass!(SecurityIndexingUsage => [SECURITY_INDEXING_USAGE]);
 
-impl<'tcx> LateLintPass<'tcx> for SecurityIndexingUsage {
-    /// Detect indexing and slicing operations.
+/// Wraps a static string so it can be passed to `emit_span_lint`, which
+/// requires a type implementing `Diagnostic` rather than a plain closure.
+///
+/// # Fields
+/// - `0` (`&'static str`) - The lint message to display at the flagged site.
+struct LintMsg(&'static str);
+
+impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for LintMsg {
+    /// Converts this message into a `Diag` at the given diagnostic level.
     ///
     /// # Arguments
-    /// * `context` (`&LateContext<'tcx>`) - The lint context, providing access
-    ///   to compiler information and utilities.
-    /// * `expression` (`&'tcx Expr<'tcx>`) - The expression being checked for
-    ///   indexing and slicing operations.
+    /// - `diagnostic_context` (`DiagCtxtHandle<'a>`) - Handle to the
+    ///   compiler's diagnostic context, used to create the `Diag`.
+    /// - `level` (`Level`) - The severity level (error, warning, etc.) at
+    ///   which the diagnostic will be emitted.
+    ///
+    /// # Returns
+    /// A `Diag<'a, G>` ready to be emitted by the compiler.
+    fn into_diag(
+        self,
+        diagnostic_context: DiagCtxtHandle<'a>,
+        level: Level,
+    ) -> Diag<'a, G> {
+        Diag::new(diagnostic_context, level, self.0)
+    }
+}
+
+impl<'tcx> LateLintPass<'tcx> for SecurityIndexingUsage {
+    /// Flags any use of the index operator `[]`, whether with a literal,
+    /// a range (slicing), or a dynamic value. All three forms can panic at
+    /// runtime on out-of-bounds access and should be replaced with safer
+    /// alternatives such as `.get()`.
+    ///
+    /// # Arguments
+    /// - `context` (`&LateContext<'tcx>`) - The lint context, providing access
+    ///   to type information and diagnostic utilities.
+    /// - `expression` (`&'tcx Expr<'tcx>`) - The HIR expression being
+    ///   inspected. Only `ExprKind::Index` nodes are acted upon.
+    ///
+    /// # Returns
+    /// `()` - Emits a lint diagnostic as a side effect if a violation is
+    /// found.
     fn check_expr(
         &mut self,
         context: &LateContext<'tcx>,
         expression: &'tcx Expr<'tcx>,
     ) {
         if let ExprKind::Index(_, index_expr, _) = &expression.kind {
-            match &index_expr.kind {
-                // Literal indexing: array[0].
-                ExprKind::Lit(_) => {
-                    context.span_lint(
-                        SECURITY_INDEXING_USAGE,
-                        expression.span,
-                        |diagnostic: &mut Diag<'_, ()>| {
-                            diagnostic.primary_message(
-                                "Usage of indexing operation detected.",
-                            );
-                        },
-                    );
-                },
-
-                // Range slicing: array[1..], array[..], array[a..b].
+            let msg = match &index_expr.kind {
                 ExprKind::Struct(_, _, _) => {
-                    context.span_lint(
-                        SECURITY_INDEXING_USAGE,
-                        expression.span,
-                        |diagnostic: &mut Diag<'_, ()>| {
-                            diagnostic.primary_message(
-                                "Usage of slicing operation detected.",
-                            );
-                        },
-                    );
+                    "Usage of slicing operation detected."
                 },
-
-                // Any other dynamic indexing: array[i].
-                _ => {
-                    context.span_lint(
-                        SECURITY_INDEXING_USAGE,
-                        expression.span,
-                        |diagnostic: &mut Diag<'_, ()>| {
-                            diagnostic.primary_message(
-                                "Usage of indexing operation detected.",
-                            );
-                        },
-                    );
-                },
-            }
+                _ => "Usage of indexing operation detected.",
+            };
+            context.emit_span_lint(
+                SECURITY_INDEXING_USAGE,
+                expression.span,
+                LintMsg(msg),
+            );
         }
     }
 
-    /// Detect implementations of indexing traits, such as `Index` and
-    /// `IndexMut`.
+    /// Flags any `impl Index` or `impl IndexMut` block. Implementing these
+    /// traits introduces the `[]` operator on a type, which carries the same
+    /// panic risk as direct indexing and warrants explicit review.
     ///
     /// # Arguments
-    /// * `context` (`&LateContext<'tcx>`) - The lint context, providing access
-    ///   to compiler information and utilities.
-    /// * `item` (`&'tcx Item<'tcx>`) - The item being checked for trait
-    ///   implementations.
+    /// - `context` (`&LateContext<'tcx>`) - The lint context, providing access
+    ///   to language item resolution and diagnostic utilities.
+    /// - `item` (`&'tcx Item<'tcx>`) - The HIR item being inspected. Only
+    ///   `ItemKind::Impl` nodes that implement `Index` or `IndexMut` are acted
+    ///   upon.
+    ///
+    /// # Returns
+    /// `()` - Emits a lint diagnostic as a side effect if a violation is
+    /// found.
     fn check_item(
         &mut self,
         context: &LateContext<'tcx>,
@@ -96,30 +113,29 @@ impl<'tcx> LateLintPass<'tcx> for SecurityIndexingUsage {
             && (context.tcx.lang_items().index_trait() == Some(def_id)
                 || context.tcx.lang_items().index_mut_trait() == Some(def_id))
         {
-            context.span_lint(
+            context.emit_span_lint(
                 SECURITY_INDEXING_USAGE,
                 item.span,
-                |diagnostic: &mut Diag<'_, ()>| {
-                    diagnostic.primary_message(
-                        "Implementation of Index/IndexMut trait detected.",
-                    );
-                },
+                LintMsg("Implementation of Index/IndexMut trait detected."),
             );
         }
     }
 }
 
-/// This module defines the `SECURITY_INDEXING_USAGE` lint, which detects the
-/// use of indexing and slicing operations in Rust code. The lint checks for
-/// array indexing (e.g., `array[index]`), slicing (e.g., `array[1..]`), and
-/// implementations of indexing traits (e.g., `Index` and `IndexMut`). The lint
-/// emits a warning whenever it detects any of these patterns, helping
-/// developers identify potential security issues related to indexing and
-/// slicing operations.
+/// Registers the lint with the compiler's lint store. Called once when the
+/// Dylint library is loaded.
+///
+/// # Arguments
+/// - `session` (`&Session`) - The current compiler session, used to initialize
+///   Dylint's configuration system.
+/// - `lint_store` (`&mut LintStore`) - The compiler's lint store into which
+///   `SECURITY_INDEXING_USAGE` and its late pass are registered.
+///
+/// # Returns
+/// `()` - Registration is performed as a side effect.
 #[unsafe(no_mangle)]
 pub fn register_lints(session: &Session, lint_store: &mut LintStore) {
     dylint_linting::init_config(session);
-
     lint_store.register_lints(&[SECURITY_INDEXING_USAGE]);
     lint_store
         .register_late_pass(|_: TyCtxt<'_>| Box::new(SecurityIndexingUsage));
@@ -127,19 +143,13 @@ pub fn register_lints(session: &Session, lint_store: &mut LintStore) {
 
 dylint_linting::dylint_library!();
 
-/// This module defines the `SECURITY_INDEXING_USAGE` lint, which detects the
-/// use of indexing and slicing operations in Rust code. The lint checks for
-/// array indexing (e.g., `array[index]`), slicing (e.g., `array[1..]`), and
-/// implementations of indexing traits (e.g., `Index` and `IndexMut`). The lint
-/// emits a warning whenever it detects any of these patterns, helping
-/// developers identify potential security issues related to indexing and
-/// slicing operations. The lint is designed to be used in security-sensitive
-/// contexts, where the use of indexing and slicing operations may lead to
-/// out-of-bounds access or other vulnerabilities if not used carefully.
 #[cfg(test)]
 mod tests {
     use dylint_testing::ui::Test;
 
+    /// Runs UI tests against the `ui` directory, verifying that
+    /// `SECURITY_INDEXING_USAGE` emits the expected diagnostics for each
+    /// test case.
     #[test]
     fn ui() {
         Test::src_base(env!("CARGO_PKG_NAME"), "ui")

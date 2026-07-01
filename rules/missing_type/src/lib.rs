@@ -7,20 +7,18 @@ extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 
-use rustc_errors::Diag;
-use rustc_hir::{Body, BodyId, Expr, ExprKind, LetStmt, PatKind};
+use rustc_errors::{
+    Diag,
+    DiagCtxtHandle,
+    Diagnostic,
+    EmissionGuarantee,
+    Level,
+};
+use rustc_hir::{Body, BodyId, ClosureKind, Expr, ExprKind, LetStmt, PatKind};
 use rustc_lint::{LateContext, LateLintPass, LintContext, LintStore};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::{Session, declare_lint, declare_lint_pass};
 
-// This lint detects missing explicit type annotations on let bindings, except
-// when the pattern is `_`. It also detects missing explicit type annotations
-// on closure parameters, except when the parameter pattern is `_`. The lint
-// will emit a warning for each case where an explicit type annotation is
-// missing.
-// e.g. `let x = 5;` will trigger a warning, while `let _ = 5;` will not.
-// Similarly, `|a, b| a + b` will trigger a warning for both parameters, while
-// `|_, b| b` will only trigger a warning for the second parameter.
 declare_lint! {
     pub MISSING_LET_TYPE,
     Warn,
@@ -38,21 +36,52 @@ declare_lint_pass!(MissingType => [
     MISSING_CLOSURE_PARAM_TYPE
 ]);
 
-impl<'tcx> LateLintPass<'tcx> for MissingType {
-    /// Checks for missing explicit type annotations on let bindings, except
-    /// when the pattern is `_`.
+/// Wraps a static string so it can be passed to `emit_span_lint`, which
+/// requires a type implementing `Diagnostic` rather than a plain closure.
+///
+/// # Fields
+/// - `0` (`&'static str`) - The lint message to display at the flagged site.
+struct LintMsg(&'static str);
+
+impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for LintMsg {
+    /// Converts this message into a `Diag` at the given diagnostic level.
     ///
     /// # Arguments
-    /// * `context` (`&LateContext<'tcx>`) - The lint context providing access
-    ///   to the compiler's internal state.
-    /// * `local` (`&'tcx LetStmt<'tcx>`) - The let statement being checked for
-    ///   a type annotation.
+    /// - `diagnostic_context` (`DiagCtxtHandle<'a>`) - Handle to the
+    ///   compiler's diagnostic context, used to create the `Diag`.
+    /// - `level` (`Level`) - The severity level (error, warning, etc.) at
+    ///   which the diagnostic will be emitted.
+    ///
+    /// # Returns
+    /// A `Diag<'a, G>` ready to be emitted by the compiler.
+    fn into_diag(
+        self,
+        diagnostic_context: DiagCtxtHandle<'a>,
+        level: Level,
+    ) -> Diag<'a, G> {
+        Diag::new(diagnostic_context, level, self.0)
+    }
+}
+
+impl<'tcx> LateLintPass<'tcx> for MissingType {
+    /// Flags `let` bindings that have no explicit type annotation, unless the
+    /// pattern is `_`, the binding comes from a macro expansion, or the span
+    /// is the result of compiler desugaring (async, `?`, `for`, etc.).
+    ///
+    /// # Arguments
+    /// - `context` (`&LateContext<'tcx>`) - The lint context, providing access
+    ///   to type information and diagnostic utilities.
+    /// - `local` (`&'tcx LetStmt<'tcx>`) - The `let` statement being
+    ///   inspected. Only statements whose `ty` field is `None` are flagged.
+    ///
+    /// # Returns
+    /// `()` - Emits a lint diagnostic as a side effect if a violation is
+    /// found.
     fn check_local(
         &mut self,
         context: &LateContext<'tcx>,
         local: &'tcx LetStmt<'tcx>,
     ) {
-        // Skip if the pattern is `_`.
         if matches!(local.pat.kind, PatKind::Wild) {
             return;
         }
@@ -61,48 +90,40 @@ impl<'tcx> LateLintPass<'tcx> for MissingType {
             return;
         };
 
-        // Skip if the let statement is from a macro expansion, as it may not
-        // be possible to determine the type annotation in that case.
         if context.tcx.hir_body(body_id).value.span.from_expansion() {
             return;
         }
 
-        // Skip if the let statement is from a macro expansion, as it may not
-        // be possible to determine the type annotation in that case.
-        // Ignore anything coming from macro expansion (async_trait, derives,
-        // etc.)
         if local.span.from_expansion() {
             return;
         }
 
-        // Ignore desugared constructs (async lowering, ?, for loops, etc.)
         if local.span.desugaring_kind().is_some() {
             return;
         }
 
-        // Check if the let statement has an explicit type annotation. If not,
-        // emit a warning.
         if local.ty.is_none() {
-            context.span_lint(
+            context.emit_span_lint(
                 MISSING_LET_TYPE,
                 local.pat.span,
-                |diagnostic: &mut Diag<'_, ()>| {
-                    diagnostic.primary_message(
-                        "Missing explicit type annotation on let binding.",
-                    );
-                },
+                LintMsg("Missing explicit type annotation on let binding."),
             );
         }
     }
 
-    /// Checks for missing explicit type annotations on closure parameters,
-    /// except when the parameter pattern is `_`.
+    /// Flags closure parameters that have no explicit type annotation, unless
+    /// the parameter pattern is `_` or the closure is a compiler-generated
+    /// coroutine (async blocks, async functions).
     ///
     /// # Arguments
-    /// * `context` (`&LateContext<'tcx>`) - The lint context providing access
-    ///   to the compiler's internal state.
-    /// * `expression` (`&'tcx Expr<'tcx>`) - The expression being checked for
-    ///   closure parameters with missing type annotations.
+    /// - `context` (`&LateContext<'tcx>`) - The lint context, providing access
+    ///   to HIR bodies and diagnostic utilities.
+    /// - `expression` (`&'tcx Expr<'tcx>`) - The expression being inspected.
+    ///   Only `ExprKind::Closure` nodes are acted upon.
+    ///
+    /// # Returns
+    /// `()` - Emits a lint diagnostic as a side effect for each parameter
+    ///   that is missing a type annotation.
     fn check_expr(
         &mut self,
         context: &LateContext<'tcx>,
@@ -112,79 +133,63 @@ impl<'tcx> LateLintPass<'tcx> for MissingType {
             return;
         }
 
-        // Only check closure expressions.
         let ExprKind::Closure(closure): &ExprKind<'tcx> = &expression.kind
         else {
             return;
         };
 
-        // Skip if the expression is from a macro expansion, as it may not be
-        // possible to determine the type annotation in that case.
-        if matches!(closure.kind, rustc_hir::ClosureKind::Coroutine(_)) {
+        if matches!(closure.kind, ClosureKind::Coroutine(_)) {
             return;
         }
 
-        // Get the body of the closure to access its parameters.
         let body: &Body<'_> = context.tcx.hir_body(closure.body);
 
-        // Iterate over the parameters of the closure. For each parameter,
-        // check if it has an explicit type annotation. If not, and if
-        // the parameter pattern is not `_`, emit a warning.
         for param in body.params {
-            // Skip if the parameter pattern is `_`.
             if matches!(param.pat.kind, PatKind::Wild) {
                 continue;
             }
 
-            // Check if the parameter has an explicit type annotation. If not,
-            // emit a warning.
             if param.ty_span.is_empty() || param.ty_span == param.pat.span {
-                context.span_lint(
+                context.emit_span_lint(
                     MISSING_CLOSURE_PARAM_TYPE,
                     param.pat.span,
-                    |diagnostic: &mut Diag<'_, ()>| {
-                        diagnostic.primary_message(
-                            "Closure parameter missing explicit type annotation.",
-                        );
-                    },
+                    LintMsg(
+                        "Closure parameter missing explicit type annotation.",
+                    ),
                 );
             }
         }
     }
 }
 
-/// Registers the lints defined in this library with the Rust compiler. This
-/// function is called by the compiler when the library is loaded as a plugin.
-/// It initializes the lint configuration and registers the lints and their
-/// corresponding lint pass with the compiler's lint store.
+/// Registers both lints with the compiler's lint store. Called once when the
+/// Dylint library is loaded.
 ///
 /// # Arguments
-/// * `session` (`&Session`) - The compiler session providing access to the
-///   compiler's internal state and configuration.
-/// * `lint_store` (`&mut LintStore`) - The lint store where the lints defined
-///   in this library will be registered.
+/// - `session` (`&Session`) - The current compiler session, used to initialize
+///   Dylint's configuration system.
+/// - `lint_store` (`&mut LintStore`) - The compiler's lint store into which
+///   `MISSING_LET_TYPE`, `MISSING_CLOSURE_PARAM_TYPE`, and their shared late
+///   pass are registered.
+///
+/// # Returns
+/// `()` - Registration is performed as a side effect.
 #[unsafe(no_mangle)]
 pub fn register_lints(session: &Session, lint_store: &mut LintStore) {
     dylint_linting::init_config(session);
-
     lint_store.register_lints(&[MISSING_LET_TYPE, MISSING_CLOSURE_PARAM_TYPE]);
     lint_store.register_late_pass(|_: TyCtxt<'_>| Box::new(MissingType));
 }
 
 dylint_linting::dylint_library!();
 
-/// UI test for the `missing_type` lint. This test compiles the code in the
-/// `ui` directory and checks that the expected warnings are emitted for
-/// missing explicit type annotations on let bindings and closure parameters,
-/// while ensuring that no warnings are emitted for cases where the pattern is
-/// `_`. The test uses the `dylint_testing` crate to run the UI tests with the
-/// appropriate compiler flags for UI testing. The test will pass if the
-/// expected warnings are emitted and fail if any unexpected warnings are
-/// emitted or if the expected warnings are not emitted.
 #[cfg(test)]
 mod tests {
     use dylint_testing::ui::Test;
 
+    /// Runs UI tests against the `ui` directory, verifying that
+    /// `MISSING_LET_TYPE` and `MISSING_CLOSURE_PARAM_TYPE` emit the expected
+    /// diagnostics and stay silent on exempt patterns.
     #[test]
     fn ui() {
         Test::src_base(env!("CARGO_PKG_NAME"), "ui")
